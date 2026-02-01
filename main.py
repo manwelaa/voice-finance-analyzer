@@ -1,36 +1,14 @@
-import os
+# main.py
 import io
-import json
-import tempfile
-import platform
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
 from pydub import AudioSegment
-from groq import Groq
+from ai_model import analyze_text
 
-# ---------- Load ENV ----------
-load_dotenv()
-
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_KEY:
-    raise Exception("GROQ_API_KEY missing")
-
-groq_client = Groq(api_key=GROQ_KEY)
-
-# ---------- Setup FFmpeg (Cross-platform) ----------
-if platform.system() == "Windows":
-    AudioSegment.converter = r"C:\ffmpeg\bin\ffmpeg.exe"
-    AudioSegment.ffprobe = r"C:\ffmpeg\bin\ffprobe.exe"
-else:
-    AudioSegment.converter = "ffmpeg"
-    AudioSegment.ffprobe = "ffprobe"
-
-# ---------- App ----------
-app = FastAPI(title="Voice & Text Finance Analyzer")
+app = FastAPI(title="Arabic Voice Finance Analyzer")
 
 # ---------- CORS ----------
 app.add_middleware(
@@ -48,114 +26,56 @@ templates = Jinja2Templates(directory="templates")
 def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-# ---------- Text Input ----------
-class TextInput(BaseModel):
-    text: str
-
-# ---------- Finance Prompt ----------
-FINANCE_PROMPT = """
-You are a financial analysis AI.
-
-Analyze the following sentence and return ONLY a JSON object.
-
-If the expense category does NOT match any common category,
-generate a NEW meaningful category name.
-
-Return JSON in this exact format:
-
-{
-  "amount": number | null,
-  "category": "string",
-  "item": "string | null",
-  "place": "string | null",
-  "type": "expense | income"
-}
-
-Sentence:
-"{text}"
-"""
-
 # ---------- Text Analyze ----------
 @app.post("/analyze")
-def analyze_text(input: TextInput):
-    try:
-        prompt = FINANCE_PROMPT.format(text=input.text)
+def text_analyze(payload: dict):
+    text = payload.get("text")
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
 
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-
-        output = response.choices[0].message.content
-        start = output.find("{")
-        end = output.rfind("}")
-        parsed = json.loads(output[start:end+1])
-
-        return {"analysis": parsed}
-
-    except Exception as e:
-        print("Text analyze error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    analysis = analyze_text(text)
+    return JSONResponse({"text": text, "analysis": analysis})
 
 # ---------- Voice Analyze ----------
 @app.post("/voice")
-async def analyze_voice(file: UploadFile = File(...)):
+async def voice_analyze(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
     try:
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="Empty file")
-
-        suffix = os.path.splitext(file.filename)[1]
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-
-        audio = AudioSegment.from_file(tmp_path)
+        audio_bytes = await file.read()
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
         audio = audio.set_channels(1).set_frame_rate(16000)
 
-        wav_tmp = tmp_path + ".wav"
-        audio.export(wav_tmp, format="wav")
+        buffer = io.BytesIO()
+        audio.export(buffer, format="wav")
+        buffer.seek(0)
+        buffer.name = "voice.wav"
 
-        with open(wav_tmp, "rb") as f:
-            buffer = io.BytesIO(f.read())
-            buffer.name = "voice.wav"
+        # Groq transcription عربي
+        from groq import Groq
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        GROQ_KEY = os.getenv("GROQ_API_KEY")
+        client = Groq(api_key=GROQ_KEY)
 
-        transcript = groq_client.audio.transcriptions.create(
+        transcript = client.audio.transcriptions.create(
             model="whisper-large-v3-turbo",
             file=buffer,
             language="ar"
         )
 
-        text = transcript.text
+        text = transcript.text.strip()
+        analysis = analyze_text(text)
 
-        prompt = FINANCE_PROMPT.format(text=text)
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-
-        output = response.choices[0].message.content
-        start = output.find("{")
-        end = output.rfind("}")
-        parsed = json.loads(output[start:end+1])
-
-        os.remove(tmp_path)
-        os.remove(wav_tmp)
-
-        return {
-            "text": text,
-            "analysis": parsed
-        }
+        return JSONResponse({"text": text, "analysis": analysis})
 
     except Exception as e:
-        print("Voice analyze error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-# ---------- Run Server ----------
+
+# ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

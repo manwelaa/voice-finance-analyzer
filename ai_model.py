@@ -1,63 +1,68 @@
+# ai_model.py
 import os
 import json
 from dotenv import load_dotenv
-import openai
-import dateparser
-from typing import Dict
+from groq import Groq
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_KEY:
+    raise Exception("GROQ_API_KEY missing")
+
+client = Groq(api_key=GROQ_KEY)
 
 PROMPT_TEMPLATE = """
-Extract financial transaction details from the following user text.
-Return a strict JSON object only, with keys:
-- amount
-- category (Food, Shopping, Bills, Transport, Health, Education, Entertainment, Other)
-- date (YYYY-MM-DD)
-- description
+أنت مساعد ذكي لتحليل المعاملات المالية باللغة العربية.
+النص قد يحتوي على عدة معاملات في نفس الجملة.
+قم بتحليل كل عملية وارجع JSON List فقط، مثال:
 
-Now analyse this text:
+[
+  {{"amount":300,"category":"ملابس","item":"فستان","place":"المول","type":"shopping"}},
+  {{"amount":50,"category":"مشروبات","item":"عصير","place":"القهوة","type":"food"}}
+]
+
+احرص على:
+- اقتراح category ذكي لكل عملية.
+- تحديد type ذكي لكل عملية (مثل: shopping, food, health, education, entertainment, bills).
+- استخراج المبلغ بدقة.
+- item و place إذا موجودين.
+- لا تخرج عن JSON List.
+- اجعل كل object مكتمل بدون قيم null إلا إذا فعلاً غير موجودة.
+
+النص:
 "{text}"
 """
 
-def call_openai_extract(text: str) -> Dict:
-    prompt = PROMPT_TEMPLATE.format(text=text.replace('"', '\\"'))
-    
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+def analyze_text(text: str) -> list:
+    """
+    يحلل نص عربي ويخرج قائمة JSON لكل عملية، مع اقتراح type ذكي.
+    """
+    prompt = PROMPT_TEMPLATE.format(text=text)
 
-    content = resp.choices[0].message["content"].strip()
-
-    # Try loading JSON
     try:
-        data = json.loads(content)
-    except:
-        start = content.find('{')
-        end = content.rfind('}')
-        json_text = content[start:end+1]
-        data = json.loads(json_text)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
 
-    # Normalize amount
-    try:
-        data["amount"] = float(data.get("amount"))
-    except:
-        data["amount"] = None
+        output = response.choices[0].message.content.strip()
 
-    # Normalize date
-    parsed = dateparser.parse(data.get("date"))
-    if parsed:
-        data["date"] = parsed.strftime("%Y-%m-%d")
-    else:
-        data["date"] = dateparser.parse("today").strftime("%Y-%m-%d")
+        # محاولة استخراج قائمة JSON
+        start = output.find("[")
+        end = output.rfind("]") + 1
+        parsed_list = json.loads(output[start:end])
 
-    # Defaults
-    if not data.get("category"):
-        data["category"] = "Other"
+        # ضمان القيم لكل عملية
+        for parsed in parsed_list:
+            parsed["amount"] = parsed.get("amount")
+            parsed["category"] = parsed.get("category") or "Other"
+            parsed["item"] = parsed.get("item")
+            parsed["place"] = parsed.get("place")
+            parsed["type"] = parsed.get("type") or "expense"
 
-    if not data.get("description"):
-        data["description"] = text[:80]
+        return parsed_list
 
-    return data
+    except Exception as e:
+        return [{"error": str(e)}]
